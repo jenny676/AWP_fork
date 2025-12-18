@@ -8,7 +8,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 
 import os
 
@@ -17,19 +16,33 @@ from preactresnet import PreActResNet18
 from utils import *
 from utils_awp import AdvWeightPerturb
 
-mu = torch.tensor(cifar10_mean).view(3, 1, 1).cuda()
-std = torch.tensor(cifar10_std).view(3, 1, 1).cuda()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+mu = torch.tensor(cifar10_mean, dtype=torch.float32).view(3, 1, 1).to(device)
+std = torch.tensor(cifar10_std, dtype=torch.float32).view(3, 1, 1).to(device)
+
 
 
 def normalize(X):
-    return (X - mu)/std
+    # ensure X is on same device/dtype as mu/std
+    return (X - mu) / std
 
 
-upper_limit, lower_limit = 1,0
+upper_limit, lower_limit = 1.0, 0.0
 
 
-def clamp(X, lower_limit, upper_limit):
-    return torch.max(torch.min(X, upper_limit), lower_limit)
+def clamp(X, lower=lower_limit, upper=upper_limit):
+    """Stable clamp that handles scalars or tensors; returns same dtype/device as X."""
+    # convert bounds to tensors on X.device and X.dtype
+    if not torch.is_tensor(lower):
+        lower = torch.tensor(lower, dtype=X.dtype, device=X.device)
+    else:
+        lower = lower.to(device=X.device, dtype=X.dtype)
+    if not torch.is_tensor(upper):
+        upper = torch.tensor(upper, dtype=X.dtype, device=X.device)
+    else:
+        upper = upper.to(device=X.device, dtype=X.dtype)
+    return torch.max(torch.min(X, upper), lower)
 
 
 class Batches():
@@ -186,7 +199,8 @@ def main():
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     transforms = [Crop(32, 32), FlipLR()]
     if args.cutout:
@@ -317,9 +331,10 @@ def main():
             X, y = batch['input'], batch['target']
             if args.mixup:
                 X, y_a, y_b, lam = mixup_data(X, y, args.mixup_alpha)
-                X, y_a, y_b = map(Variable, (X, y_a, y_b))
+                X, y_a, y_b = X.to(device), y_a.to(device), y_b.to(device)
             lr = lr_schedule(epoch + (i + 1) / len(train_batches))
-            opt.param_groups[0].update(lr=lr)
+            for pg in opt.param_groups:
+                pg['lr'] = lr
 
             if args.attack == 'pgd':
                 # Random initialization
@@ -382,29 +397,31 @@ def main():
         test_robust_loss = 0
         test_robust_acc = 0
         test_n = 0
-        for i, batch in enumerate(test_batches):
-            X, y = batch['input'], batch['target']
 
-            # Random initialization
-            if args.attack == 'none':
-                delta = torch.zeros_like(X)
-            else:
-                delta = attack_pgd(model, X, y, epsilon, pgd_alpha, args.attack_iters_test, args.restarts, args.norm, early_stop=args.eval)
-            delta = delta.detach()
-
-            robust_output = model(normalize(torch.clamp(X + delta[:X.size(0)], min=lower_limit, max=upper_limit)))
-            robust_loss = criterion(robust_output, y)
-
-            output = model(normalize(X))
-            loss = criterion(output, y)
-
-            test_robust_loss += robust_loss.item() * y.size(0)
-            test_robust_acc += (robust_output.max(1)[1] == y).sum().item()
-            test_loss += loss.item() * y.size(0)
-            test_acc += (output.max(1)[1] == y).sum().item()
-            test_n += y.size(0)
-
-        test_time = time.time()
+        with torch.no_grad():
+            for i, batch in enumerate(test_batches):
+                X, y = batch['input'], batch['target']
+    
+                # Random initialization
+                if args.attack == 'none':
+                    delta = torch.zeros_like(X)
+                else:
+                    delta = attack_pgd(model, X, y, epsilon, pgd_alpha, args.attack_iters_test, args.restarts, args.norm, early_stop=args.eval)
+                delta = delta.detach()
+    
+                robust_output = model(normalize(torch.clamp(X + delta[:X.size(0)], min=lower_limit, max=upper_limit)))
+                robust_loss = criterion(robust_output, y)
+    
+                output = model(normalize(X))
+                loss = criterion(output, y)
+    
+                test_robust_loss += robust_loss.item() * y.size(0)
+                test_robust_acc += (robust_output.max(1)[1] == y).sum().item()
+                test_loss += loss.item() * y.size(0)
+                test_acc += (output.max(1)[1] == y).sum().item()
+                test_n += y.size(0)
+    
+            test_time = time.time()
 
         if args.val:
             val_loss = 0
@@ -412,27 +429,28 @@ def main():
             val_robust_loss = 0
             val_robust_acc = 0
             val_n = 0
-            for i, batch in enumerate(val_batches):
-                X, y = batch['input'], batch['target']
-
-                # Random initialization
-                if args.attack == 'none':
-                    delta = torch.zeros_like(X)
-                else:
-                    delta = attack_pgd(model, X, y, epsilon, pgd_alpha, args.attack_iters_test, args.restarts, args.norm, early_stop=args.eval)
-                delta = delta.detach()
-
-                robust_output = model(normalize(torch.clamp(X + delta[:X.size(0)], min=lower_limit, max=upper_limit)))
-                robust_loss = criterion(robust_output, y)
-
-                output = model(normalize(X))
-                loss = criterion(output, y)
-
-                val_robust_loss += robust_loss.item() * y.size(0)
-                val_robust_acc += (robust_output.max(1)[1] == y).sum().item()
-                val_loss += loss.item() * y.size(0)
-                val_acc += (output.max(1)[1] == y).sum().item()
-                val_n += y.size(0)
+            with torch.no_grad():
+                for i, batch in enumerate(val_batches):
+                    X, y = batch['input'], batch['target']
+    
+                    # Random initialization
+                    if args.attack == 'none':
+                        delta = torch.zeros_like(X)
+                    else:
+                        delta = attack_pgd(model, X, y, epsilon, pgd_alpha, args.attack_iters_test, args.restarts, args.norm, early_stop=args.eval)
+                    delta = delta.detach()
+    
+                    robust_output = model(normalize(torch.clamp(X + delta[:X.size(0)], min=lower_limit, max=upper_limit)))
+                    robust_loss = criterion(robust_output, y)
+    
+                    output = model(normalize(X))
+                    loss = criterion(output, y)
+    
+                    val_robust_loss += robust_loss.item() * y.size(0)
+                    val_robust_acc += (robust_output.max(1)[1] == y).sum().item()
+                    val_loss += loss.item() * y.size(0)
+                    val_acc += (output.max(1)[1] == y).sum().item()
+                    val_n += y.size(0)
 
         if not args.eval:
             logger.info('%d \t %.1f \t \t %.1f \t \t %.4f \t %.4f \t %.4f \t %.4f \t \t %.4f \t \t %.4f \t %.4f \t %.4f \t \t %.4f',
