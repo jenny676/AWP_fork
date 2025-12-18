@@ -71,7 +71,7 @@ def mixup_data(x, y, alpha=1.0):
         lam = 1
 
     batch_size = x.size()[0]
-    index = torch.randperm(batch_size).cuda()
+    index = torch.randperm(batch_size, device=device)
 
     mixed_x = lam * x + (1 - lam) * x[index, :]
     y_a, y_b = y, y[index]
@@ -85,10 +85,10 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 def attack_pgd(model, X, y, epsilon, alpha, attack_iters, restarts,
                norm, early_stop=False,
                mixup=False, y_a=None, y_b=None, lam=None):
-    max_loss = torch.zeros(y.shape[0]).cuda()
-    max_delta = torch.zeros_like(X).cuda()
+    max_loss = torch.zeros(y.shape[0], device=device, dtype=torch.float32)
+    max_delta = torch.zeros_like(X, device=X.device)
     for _ in range(restarts):
-        delta = torch.zeros_like(X).cuda()
+        delta = torch.zeros_like(X, device=X.device)
         if norm == "l_inf":
             delta.uniform_(-epsilon, epsilon)
         elif norm == "l_2":
@@ -236,8 +236,8 @@ def main():
     else:
         raise ValueError("Unknown model")
 
-    model = nn.DataParallel(model).cuda()
-    proxy = nn.DataParallel(proxy).cuda()
+    model = nn.DataParallel(model).to(device)
+    proxy = nn.DataParallel(proxy).to(device)
 
     if args.l2:
         decay, no_decay = [], []
@@ -258,10 +258,10 @@ def main():
     criterion = nn.CrossEntropyLoss()
 
     if args.attack == 'free':
-        delta = torch.zeros(args.batch_size, 3, 32, 32).cuda()
+        delta = torch.zeros(args.batch_size, 3, 32, 32, device=device)
         delta.requires_grad = True
     elif args.attack == 'fgsm' and args.fgsm_init == 'previous':
-        delta = torch.zeros(args.batch_size, 3, 32, 32).cuda()
+        delta = torch.zeros(args.batch_size, 3, 32, 32, device=device)
         delta.requires_grad = True
 
     if args.attack == 'free':
