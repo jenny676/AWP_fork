@@ -181,6 +181,18 @@ def get_args():
     parser.add_argument('--awp-warmup', default=0, type=int)
     return parser.parse_args()
 
+def save_checkpoint(state, fname):
+    """
+    Atomic save: write to tmp file then rename.
+    state: dict
+    fname: target path string
+    """
+    tmp = str(fname) + '.tmp'
+    torch.save(state, tmp)
+    # atomic rename
+    Path(tmp).replace(fname)
+    logger.info(f"Saved checkpoint: {fname}")
+
 def main():
     args = get_args()
     if args.awp_gamma <= 0.0:
@@ -201,18 +213,6 @@ def main():
 
     logger.info(args)
 
-def save_checkpoint(state, fname):
-    """
-    Atomic save: write to tmp file then rename.
-    state: dict
-    fname: target path string
-    """
-    tmp = str(fname) + '.tmp'
-    torch.save(state, tmp)
-    # atomic rename
-    Path(tmp).replace(fname)
-    logger.info(f"Saved checkpoint: {fname}")
-
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -232,16 +232,20 @@ def save_checkpoint(state, fname):
         val_batches = Batches(val_set, args.batch_size, shuffle=False, num_workers=2)
     else:
         dataset = cifar10(args.data_dir)
-    train_set = list(zip(transpose(pad(dataset['train']['data'], 4)/255.), dataset['train']['labels']))
-    if args.train_fraction < 1.0:
-        assert 0.0 < args.train_fraction <= 1.0
-        n_total = len(train_set)
-        n_use = int(n_total * args.train_fraction)
-    
-        # deterministic subset (recommended)
-        rng = np.random.RandomState(args.seed)
-        indices = rng.permutation(n_total)[:n_use]
-        train_set = [train_set[i] for i in indices]
+    train_set_full = list(zip(transpose(pad(dataset['train']['data'], 4)/255.), dataset['train']['labels']))
+    if args.resume_from and 'train_subset_indices' in ckpt and ckpt['train_subset_indices'] is not None:
+        train_subset_indices = np.array(ckpt['train_subset_indices'], dtype=int)
+        train_set = [train_set_full[i] for i in train_subset_indices]
+        logger.info(f"Restored train subset of size {len(train_set)} from checkpoint")
+    else:
+        # fallback: regenerate deterministically from args.seed (if user expects that)
+        if args.train_fraction < 1.0:
+            rng = np.random.RandomState(args.seed)
+            train_subset_indices = rng.permutation(len(train_set_full))[:int(len(train_set_full) * args.train_fraction)]
+            train_set = [train_set_full[i] for i in train_subset_indices]
+        else:
+            train_subset_indices = None
+            train_set = train_set_full
     # ----------------------------------
     
     train_set_x = Transform(train_set, transforms)
@@ -440,6 +444,7 @@ def save_checkpoint(state, fname):
                         'rng_numpy': np.random.get_state(),
                         'rng_python': pyrandom.getstate(),
                         'rng_torch': torch.get_rng_state(),
+                        'train_subset_indices': None if train_subset_indices is None else train_subset_indices.tolist(),
                     }
                     if torch.cuda.is_available():
                         state['rng_cuda_all'] = torch.cuda.get_rng_state_all()
@@ -581,6 +586,7 @@ def save_checkpoint(state, fname):
             'rng_numpy': np.random.get_state(),
             'rng_python': pyrandom.getstate(),
             'rng_torch': torch.get_rng_state(),
+            'train_subset_indices': None if train_subset_indices is None else train_subset_indices.tolist(),
         }
         if torch.cuda.is_available():
             state['rng_cuda_all'] = torch.cuda.get_rng_state_all()
@@ -598,6 +604,7 @@ def save_checkpoint(state, fname):
             'rng_python': pyrandom.getstate(),
             'rng_torch': torch.get_rng_state(),
             'exception': str(e),
+            'train_subset_indices': None if train_subset_indices is None else train_subset_indices.tolist(),
         }
         if torch.cuda.is_available():
             state['rng_cuda_all'] = torch.cuda.get_rng_state_all()
