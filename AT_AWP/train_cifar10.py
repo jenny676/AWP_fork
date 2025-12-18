@@ -181,17 +181,23 @@ def get_args():
     parser.add_argument('--awp-warmup', default=0, type=int)
     return parser.parse_args()
 
-def save_checkpoint(state, fname):
+def save_checkpoint(state, fname, logger=None):
     """
-    Atomic save: write to tmp file then rename.
-    state: dict
-    fname: target path string
+    Atomic checkpoint save.
+    - state: dict to save (torch.save-able)
+    - fname: target path (string or Path)
+    - logger: optional logger to log success
     """
-    tmp = str(fname) + '.tmp'
+    fname = str(fname)
+    d = os.path.dirname(fname)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+    tmp = fname + '.tmp'
     torch.save(state, tmp)
-    # atomic rename
     Path(tmp).replace(fname)
-    logger.info(f"Saved checkpoint: {fname}")
+    if logger is not None:
+        logger.info(f"Saved checkpoint: {fname}")
 
 def main():
     args = get_args()
@@ -213,6 +219,12 @@ def main():
 
     logger.info(args)
 
+    ckpt = None
+    if args.resume_from:
+        logger.info(f"Loading checkpoint for resume-from: {args.resume_from}")
+        ckpt = torch.load(args.resume_from, map_location=device)
+
+
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -233,16 +245,17 @@ def main():
     else:
         dataset = cifar10(args.data_dir)
     train_set_full = list(zip(transpose(pad(dataset['train']['data'], 4)/255.), dataset['train']['labels']))
-    if args.resume_from and 'train_subset_indices' in ckpt and ckpt['train_subset_indices'] is not None:
+    if ckpt is not None and 'train_subset_indices' in ckpt and ckpt['train_subset_indices'] is not None:
         train_subset_indices = np.array(ckpt['train_subset_indices'], dtype=int)
         train_set = [train_set_full[i] for i in train_subset_indices]
         logger.info(f"Restored train subset of size {len(train_set)} from checkpoint")
     else:
-        # fallback: regenerate deterministically from args.seed (if user expects that)
+        # fallback: deterministic subsample from args.seed if requested
         if args.train_fraction < 1.0:
             rng = np.random.RandomState(args.seed)
             train_subset_indices = rng.permutation(len(train_set_full))[:int(len(train_set_full) * args.train_fraction)]
             train_set = [train_set_full[i] for i in train_subset_indices]
+            logger.info(f"Using {len(train_set)} / {len(train_set_full)} training samples (seed={args.seed})")
         else:
             train_subset_indices = None
             train_set = train_set_full
@@ -292,6 +305,42 @@ def main():
     awp_adversary = AdvWeightPerturb(model=model, proxy=proxy, proxy_optim=proxy_opt, gamma=args.awp_gamma)
 
     criterion = nn.CrossEntropyLoss()
+    
+    if ckpt is not None:
+        # model weights
+        if 'model_state' in ckpt:
+            try:
+                model.load_state_dict(ckpt['model_state'])
+                logger.info("Loaded model weights from checkpoint.")
+            except Exception as e:
+                logger.warning(f"Could not fully load model state from checkpoint: {e}")
+
+        # optimizer state
+        if 'opt_state' in ckpt:
+            try:
+                opt.load_state_dict(ckpt['opt_state'])
+                logger.info("Loaded optimizer state from checkpoint.")
+            except Exception as e:
+                logger.warning(f"Could not fully load optimizer state from checkpoint: {e}")
+
+        # optionally restore other bookkeeping
+        best_test_robust_acc = ckpt.get('best_test_robust_acc', best_test_robust_acc)
+        best_val_robust_acc = ckpt.get('best_val_robust_acc', best_val_robust_acc)
+
+        # RNG states (optional but recommended for reproducibility)
+        if 'rng_numpy' in ckpt:
+            np.random.set_state(ckpt['rng_numpy'])
+        if 'rng_python' in ckpt:
+            pyrandom.setstate(ckpt['rng_python'])
+        if 'rng_torch' in ckpt:
+            torch.set_rng_state(ckpt['rng_torch'])
+        if torch.cuda.is_available() and 'rng_cuda_all' in ckpt:
+            torch.cuda.set_rng_state_all(ckpt['rng_cuda_all'])
+
+        # determine start epoch if present in checkpoint
+        if 'epoch' in ckpt:
+            start_epoch = int(ckpt.get('epoch', 0)) + 1
+            logger.info(f"Resuming training from epoch {start_epoch}")
 
     if args.attack == 'free':
         delta = torch.zeros(args.batch_size, 3, 32, 32, device=device)
@@ -449,7 +498,7 @@ def main():
                     if torch.cuda.is_available():
                         state['rng_cuda_all'] = torch.cuda.get_rng_state_all()
                     latest_path = os.path.join(args.fname, 'model_latest.pth')
-                    save_checkpoint(state, latest_path)
+                    save_checkpoint(state, latest_path, logger)
     
     
                 if epoch >= args.awp_warmup:
@@ -590,7 +639,7 @@ def main():
         }
         if torch.cuda.is_available():
             state['rng_cuda_all'] = torch.cuda.get_rng_state_all()
-        save_checkpoint(state, os.path.join(args.fname, 'model_interrupt.pth'))
+        save_checkpoint(state, os.path.join(args.fname, 'model_interrupt.pth'), logger)
         raise
     except Exception as e:
         logger.exception("Exception during training — saving crash checkpoint...")
@@ -608,7 +657,7 @@ def main():
         }
         if torch.cuda.is_available():
             state['rng_cuda_all'] = torch.cuda.get_rng_state_all()
-        save_checkpoint(state, os.path.join(args.fname, 'model_crash.pth'))
+        save_checkpoint(state, os.path.join(args.fname, 'model_crash.pth'), logger)
         raise
 
 
