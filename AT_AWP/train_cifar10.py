@@ -332,10 +332,34 @@ def main():
             np.random.set_state(ckpt['rng_numpy'])
         if 'rng_python' in ckpt:
             pyrandom.setstate(ckpt['rng_python'])
+        
         if 'rng_torch' in ckpt:
-            torch.set_rng_state(ckpt['rng_torch'])
+            rng_torch = ckpt['rng_torch']
+            # if it's not already a torch Tensor of dtype uint8, convert it
+            if not isinstance(rng_torch, torch.Tensor) or rng_torch.dtype != torch.uint8:
+                try:
+                    rng_torch = torch.tensor(rng_torch, dtype=torch.uint8)
+                except Exception:
+                    # Last-resort: if stored as bytes, wrap into ByteTensor
+                    rng_torch = torch.tensor(list(rng_torch), dtype=torch.uint8)
+            torch.set_rng_state(rng_torch)
+        
         if torch.cuda.is_available() and 'rng_cuda_all' in ckpt:
-            torch.cuda.set_rng_state_all(ckpt['rng_cuda_all'])
+            cuda_states = ckpt['rng_cuda_all']
+            # ensure a list of byte tensors
+            converted = []
+            for s in cuda_states:
+                if not isinstance(s, torch.Tensor) or s.dtype != torch.uint8:
+                    try:
+                        s = torch.tensor(s, dtype=torch.uint8)
+                    except Exception:
+                        s = torch.tensor(list(s), dtype=torch.uint8)
+                converted.append(s)
+            try:
+                torch.cuda.set_rng_state_all(converted)
+            except Exception as e:
+                logger.warning(f"Could not set CUDA RNG state: {e}")
+
 
         # determine start epoch if present in checkpoint
         if 'epoch' in ckpt:
