@@ -240,7 +240,7 @@ def main():
     ckpt = None
     if args.resume_from:
         logger.info(f"Loading checkpoint for resume-from: {args.resume_from}")
-        ckpt = safe_torch_load(args.resume_from, map_location=device, weights_only=False)
+        ckpt = safe_torch_load(args.resume_from, map_location=device)
 
     epoch_saved = ckpt.get('epoch', None)
     logger.info(f"Checkpoint epoch: {epoch_saved}; training will resume at {epoch_saved+1 if epoch_saved is not None else 'unknown'}")
