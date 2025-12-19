@@ -24,6 +24,24 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 mu = torch.tensor(cifar10_mean, dtype=torch.float32).view(3, 1, 1).to(device)
 std = torch.tensor(cifar10_std, dtype=torch.float32).view(3, 1, 1).to(device)
 
+# --- add near imports / top of file ---
+import torch
+import logging
+
+logger = logging.getLogger(__name__)
+
+def safe_torch_load(path, map_location=None):
+    """
+    Load a checkpoint with weights_only=False for PyTorch >=2.6 compatibility.
+    Falls back to torch.load(path, map_location=...) if weights_only arg not supported.
+    """
+    try:
+        # preferred: explicit full unpickle
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        # older torch that doesn't accept weights_only
+        return torch.load(path, map_location=map_location)
+
 
 def normalize(X):
     # ensure X is on same device/dtype as mu/std
@@ -222,7 +240,10 @@ def main():
     ckpt = None
     if args.resume_from:
         logger.info(f"Loading checkpoint for resume-from: {args.resume_from}")
-        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        ckpt = safe_torch_load(args.resume_from, map_location=device, weights_only=False)
+
+    epoch_saved = ckpt.get('epoch', None)
+    logger.info(f"Checkpoint epoch: {epoch_saved}; training will resume at {epoch_saved+1 if epoch_saved is not None else 'unknown'}")
 
 
     np.random.seed(args.seed)
@@ -328,50 +349,42 @@ def main():
         best_val_robust_acc = ckpt.get('best_val_robust_acc', -1.0)
 
         # RNG states (optional but recommended for reproducibility)
-        # ---------- robust RNG restore (replace existing rng restore block) ----------
-        import types
         import numpy as _np
+        import types
         
-        def _to_byte_tensor(x):
+        def _ensure_byte_tensor(x):
+            """Return a torch.ByteTensor (dtype=uint8) on CPU suitable for set_rng_state.
+               Raises ValueError if conversion is impossible.
             """
-            Convert x to a torch.ByteTensor (dtype=torch.uint8) suitable for
-            torch.set_rng_state / torch.cuda.set_rng_state_all.
-            Returns a torch.Tensor dtype=uint8 on success, or raises ValueError.
-            """
-            # Already a torch tensor
+            # If it's a torch tensor, move to CPU and convert dtype if needed.
             if isinstance(x, torch.Tensor):
-                if x.dtype == torch.uint8:
-                    return x
-                # convert numeric tensor to uint8
-                try:
-                    return x.to(dtype=torch.uint8)
-                except Exception:
-                    # fall through to attempt other conversions
-                    pass
+                t = x.cpu()
+                if t.dtype != torch.uint8:
+                    # Convert numeric representation to uint8 preserving raw bytes
+                    try:
+                        t = t.to(dtype=torch.uint8)
+                    except Exception:
+                        # fallback: coerce via numpy
+                        t = torch.from_numpy(t.numpy().astype(_np.uint8))
+                return t.contiguous()
         
-            # NumPy array
+            # Numpy array -> uint8 tensor on CPU
             if isinstance(x, _np.ndarray):
-                try:
-                    return torch.from_numpy(x.astype(_np.uint8))
-                except Exception:
-                    pass
+                return torch.from_numpy(x.astype(_np.uint8)).contiguous()
         
-            # bytes object -> convert to list of ints then to tensor
+            # bytes/bytearray -> list of ints -> tensor
             if isinstance(x, (bytes, bytearray)):
-                return torch.tensor(list(x), dtype=torch.uint8)
+                return torch.tensor(list(x), dtype=torch.uint8).contiguous()
         
-            # Python sequence (list/tuple) of ints
+            # list / tuple / generator -> tensor
             if isinstance(x, (list, tuple, types.GeneratorType)):
-                try:
-                    return torch.tensor(list(x), dtype=torch.uint8)
-                except Exception:
-                    pass
+                return torch.tensor(list(x), dtype=torch.uint8).contiguous()
         
-            # Fallback: try to coerce via list()
+            # fallback attempt
             try:
-                return torch.tensor(list(x), dtype=torch.uint8)
+                return torch.tensor(list(x), dtype=torch.uint8).contiguous()
             except Exception as e:
-                raise ValueError(f"Could not convert RNG state of type {type(x)} to torch.uint8: {e}")
+                raise ValueError(f"Cannot convert RNG state of type {type(x)} to torch.uint8: {e}")
         
         # restore RNGs if present (robust conversions)
         if 'rng_numpy' in ckpt:
@@ -381,30 +394,28 @@ def main():
         
         if 'rng_torch' in ckpt:
             try:
-                rng_torch_raw = ckpt['rng_torch']
-                rng_torch = _to_byte_tensor(rng_torch_raw)
-                # torch.set_rng_state requires a 1-D ByteTensor; ensure contiguous
-                rng_torch = rng_torch.contiguous()
-                torch.set_rng_state(rng_torch)
+                rng_cpu = _ensure_byte_tensor(ckpt['rng_torch'])
+                torch.set_rng_state(rng_cpu)
+                logger.info("Restored CPU RNG state from checkpoint.")
             except Exception as e:
                 logger.warning(f"Failed to set CPU RNG state from checkpoint: {e}")
-                # as a fallback, skip setting CPU RNG state but continue
                 logger.debug(f"rng_torch raw type: {type(ckpt.get('rng_torch'))}")
         
         if torch.cuda.is_available() and 'rng_cuda_all' in ckpt:
             try:
                 cuda_raw = ckpt['rng_cuda_all']
-                # Expect an iterable of states (one per device). Convert each.
+                # accept list-like of states; convert each to ByteTensor and ensure on CPU (set_rng_state_all expects cpu tensors)
                 cuda_converted = []
                 for s in cuda_raw:
-                    converted = _to_byte_tensor(s)
-                    converted = converted.contiguous()
-                    cuda_converted.append(converted)
+                    t = _ensure_byte_tensor(s)
+                    cuda_converted.append(t)
                 torch.cuda.set_rng_state_all(cuda_converted)
+                logger.info("Restored CUDA RNG states from checkpoint.")
             except Exception as e:
                 logger.warning(f"Failed to set CUDA RNG states from checkpoint: {e}")
                 logger.debug(f"rng_cuda_all raw type: {type(ckpt.get('rng_cuda_all'))}")
         # ---------------------------------------------------------------------------
+
 
 
 
@@ -459,7 +470,7 @@ def main():
     if args.resume_from:
         ckpt_path = args.resume_from
         logger.info(f"Resuming from checkpoint: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = safe_torch_load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt['model_state'])
         if 'opt_state' in ckpt:
             try:
@@ -480,13 +491,13 @@ def main():
             torch.cuda.set_rng_state_all(ckpt['rng_cuda_all'])
     elif args.resume:
         start_epoch = args.resume
-        model.load_state_dict(torch.load(os.path.join(args.fname, f'model_{start_epoch-1}.pth'), map_location=device))
-        opt.load_state_dict(torch.load(os.path.join(args.fname, f'opt_{start_epoch-1}.pth'), map_location=device))
+        model.load_state_dict(safe_torch_load(os.path.join(args.fname, f'model_{start_epoch-1}.pth'), map_location=device))
+        opt.load_state_dict(safe_torch_load(os.path.join(args.fname, f'opt_{start_epoch-1}.pth'), map_location=device))
         logger.info(f'Resuming at epoch {start_epoch}')
         if os.path.exists(os.path.join(args.fname, f'model_best.pth')):
-            best_test_robust_acc = torch.load(os.path.join(args.fname, f'model_best.pth'))['test_robust_acc']
+            best_test_robust_acc = safe_torch_load(os.path.join(args.fname, f'model_best.pth'))['test_robust_acc']
         if args.val and os.path.exists(os.path.join(args.fname, f'model_val.pth')):
-            best_val_robust_acc = torch.load(os.path.join(args.fname, f'model_val.pth'))['val_robust_acc']
+            best_val_robust_acc = safe_torch_load(os.path.join(args.fname, f'model_val.pth'))['val_robust_acc']
     else:
         start_epoch = 0
 
