@@ -480,15 +480,6 @@ def main():
         start_epoch = ckpt.get('epoch', 0) + 1
         best_test_robust_acc = ckpt.get('best_test_robust_acc', best_test_robust_acc)
         best_val_robust_acc = ckpt.get('best_val_robust_acc', best_val_robust_acc)
-        # restore RNGs if present (optional)
-        if 'rng_numpy' in ckpt:
-            np.random.set_state(ckpt['rng_numpy'])
-        if 'rng_python' in ckpt:
-            pyrandom.setstate(ckpt['rng_python'])
-        if 'rng_torch' in ckpt:
-            torch.set_rng_state(ckpt['rng_torch'])
-        if torch.cuda.is_available() and 'rng_cuda_all' in ckpt:
-            torch.cuda.set_rng_state_all(ckpt['rng_cuda_all'])
     elif args.resume:
         start_epoch = args.resume
         model.load_state_dict(safe_torch_load(os.path.join(args.fname, f'model_{start_epoch-1}.pth'), map_location=device))
