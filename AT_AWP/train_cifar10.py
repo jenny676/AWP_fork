@@ -324,8 +324,8 @@ def main():
                 logger.warning(f"Could not fully load optimizer state from checkpoint: {e}")
 
         # optionally restore other bookkeeping
-        best_test_robust_acc = ckpt.get('best_test_robust_acc', best_test_robust_acc)
-        best_val_robust_acc = ckpt.get('best_val_robust_acc', best_val_robust_acc)
+        best_test_robust_acc = ckpt.get('best_test_robust_acc', -1.0)
+        best_val_robust_acc = ckpt.get('best_val_robust_acc', -1.0)
 
         # RNG states (optional but recommended for reproducibility)
         if 'rng_numpy' in ckpt:
