@@ -222,7 +222,7 @@ def main():
     ckpt = None
     if args.resume_from:
         logger.info(f"Loading checkpoint for resume-from: {args.resume_from}")
-        ckpt = torch.load(args.resume_from, map_location=device)
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
 
 
     np.random.seed(args.seed)
