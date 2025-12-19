@@ -236,15 +236,19 @@ def main():
         ])
 
     logger.info(args)
-
+    
     ckpt = None
     if args.resume_from:
         logger.info(f"Loading checkpoint for resume-from: {args.resume_from}")
         ckpt = safe_torch_load(args.resume_from, map_location=device)
-
-    epoch_saved = ckpt.get('epoch', None)
-    logger.info(f"Checkpoint epoch: {epoch_saved}; training will resume at {epoch_saved+1 if epoch_saved is not None else 'unknown'}")
-
+    else:
+        logger.info("No resume-from checkpoint provided; starting from scratch.")
+    
+    epoch_saved = ckpt.get('epoch') if ckpt is not None else None
+    logger.info(
+        f"Checkpoint epoch: {epoch_saved}; "
+        f"training will resume at {epoch_saved + 1 if epoch_saved is not None else 0}"
+)
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
