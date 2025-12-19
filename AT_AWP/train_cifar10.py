@@ -328,37 +328,84 @@ def main():
         best_val_robust_acc = ckpt.get('best_val_robust_acc', -1.0)
 
         # RNG states (optional but recommended for reproducibility)
+        # ---------- robust RNG restore (replace existing rng restore block) ----------
+        import types
+        import numpy as _np
+        
+        def _to_byte_tensor(x):
+            """
+            Convert x to a torch.ByteTensor (dtype=torch.uint8) suitable for
+            torch.set_rng_state / torch.cuda.set_rng_state_all.
+            Returns a torch.Tensor dtype=uint8 on success, or raises ValueError.
+            """
+            # Already a torch tensor
+            if isinstance(x, torch.Tensor):
+                if x.dtype == torch.uint8:
+                    return x
+                # convert numeric tensor to uint8
+                try:
+                    return x.to(dtype=torch.uint8)
+                except Exception:
+                    # fall through to attempt other conversions
+                    pass
+        
+            # NumPy array
+            if isinstance(x, _np.ndarray):
+                try:
+                    return torch.from_numpy(x.astype(_np.uint8))
+                except Exception:
+                    pass
+        
+            # bytes object -> convert to list of ints then to tensor
+            if isinstance(x, (bytes, bytearray)):
+                return torch.tensor(list(x), dtype=torch.uint8)
+        
+            # Python sequence (list/tuple) of ints
+            if isinstance(x, (list, tuple, types.GeneratorType)):
+                try:
+                    return torch.tensor(list(x), dtype=torch.uint8)
+                except Exception:
+                    pass
+        
+            # Fallback: try to coerce via list()
+            try:
+                return torch.tensor(list(x), dtype=torch.uint8)
+            except Exception as e:
+                raise ValueError(f"Could not convert RNG state of type {type(x)} to torch.uint8: {e}")
+        
+        # restore RNGs if present (robust conversions)
         if 'rng_numpy' in ckpt:
             np.random.set_state(ckpt['rng_numpy'])
         if 'rng_python' in ckpt:
             pyrandom.setstate(ckpt['rng_python'])
         
         if 'rng_torch' in ckpt:
-            rng_torch = ckpt['rng_torch']
-            # if it's not already a torch Tensor of dtype uint8, convert it
-            if not isinstance(rng_torch, torch.Tensor) or rng_torch.dtype != torch.uint8:
-                try:
-                    rng_torch = torch.tensor(rng_torch, dtype=torch.uint8)
-                except Exception:
-                    # Last-resort: if stored as bytes, wrap into ByteTensor
-                    rng_torch = torch.tensor(list(rng_torch), dtype=torch.uint8)
-            torch.set_rng_state(rng_torch)
+            try:
+                rng_torch_raw = ckpt['rng_torch']
+                rng_torch = _to_byte_tensor(rng_torch_raw)
+                # torch.set_rng_state requires a 1-D ByteTensor; ensure contiguous
+                rng_torch = rng_torch.contiguous()
+                torch.set_rng_state(rng_torch)
+            except Exception as e:
+                logger.warning(f"Failed to set CPU RNG state from checkpoint: {e}")
+                # as a fallback, skip setting CPU RNG state but continue
+                logger.debug(f"rng_torch raw type: {type(ckpt.get('rng_torch'))}")
         
         if torch.cuda.is_available() and 'rng_cuda_all' in ckpt:
-            cuda_states = ckpt['rng_cuda_all']
-            # ensure a list of byte tensors
-            converted = []
-            for s in cuda_states:
-                if not isinstance(s, torch.Tensor) or s.dtype != torch.uint8:
-                    try:
-                        s = torch.tensor(s, dtype=torch.uint8)
-                    except Exception:
-                        s = torch.tensor(list(s), dtype=torch.uint8)
-                converted.append(s)
             try:
-                torch.cuda.set_rng_state_all(converted)
+                cuda_raw = ckpt['rng_cuda_all']
+                # Expect an iterable of states (one per device). Convert each.
+                cuda_converted = []
+                for s in cuda_raw:
+                    converted = _to_byte_tensor(s)
+                    converted = converted.contiguous()
+                    cuda_converted.append(converted)
+                torch.cuda.set_rng_state_all(cuda_converted)
             except Exception as e:
-                logger.warning(f"Could not set CUDA RNG state: {e}")
+                logger.warning(f"Failed to set CUDA RNG states from checkpoint: {e}")
+                logger.debug(f"rng_cuda_all raw type: {type(ckpt.get('rng_cuda_all'))}")
+        # ---------------------------------------------------------------------------
+
 
 
         # determine start epoch if present in checkpoint
