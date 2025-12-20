@@ -42,6 +42,137 @@ def safe_torch_load(path, map_location=None):
         # older torch that doesn't accept weights_only
         return torch.load(path, map_location=map_location)
 
+# -------------------------
+# Checkpoint helpers
+# -------------------------
+def _maybe_state_dict(obj):
+    """Return state_dict() if available else None."""
+    if obj is None:
+        return None
+    return obj.state_dict() if hasattr(obj, 'state_dict') else None
+
+def save_full_checkpoint(path, model, opt, proxy=None, proxy_opt=None, awp=None,
+                         scaler=None, scheduler=None, epoch=0, batch_idx=0,
+                         best_test=-1.0, best_val=-1.0, train_subset_indices=None, logger=None, extra=None):
+    """
+    Atomic save of a full checkpoint including batch index so we can resume mid-epoch.
+    """
+    state = {
+        'epoch': int(epoch),
+        'batch_idx': int(batch_idx),
+        'model_state': model.state_dict(),
+        'opt_state': opt.state_dict(),
+        'best_test_robust_acc': best_test,
+        'best_val_robust_acc': best_val,
+        'rng_numpy': np.random.get_state(),
+        'rng_python': pyrandom.getstate(),
+        'rng_torch': torch.get_rng_state(),
+        'train_subset_indices': None if train_subset_indices is None else list(train_subset_indices),
+    }
+    # optional components
+    if proxy is not None:
+        state['proxy_state'] = _maybe_state_dict(proxy)
+    if proxy_opt is not None:
+        state['proxy_opt_state'] = _maybe_state_dict(proxy_opt)
+    if awp is not None and hasattr(awp, 'state_dict'):
+        try:
+            state['awp_state'] = awp.state_dict()
+        except Exception:
+            # fallback: store nothing if state_dict fails
+            state['awp_state'] = None
+    if scaler is not None and hasattr(scaler, 'state_dict'):
+        state['scaler_state'] = scaler.state_dict()
+    if scheduler is not None and hasattr(scheduler, 'state_dict'):
+        state['scheduler_state'] = scheduler.state_dict()
+    if extra is not None:
+        state['extra'] = extra
+    if torch.cuda.is_available():
+        # store CUDA RNGs
+        state['rng_cuda_all'] = torch.cuda.get_rng_state_all()
+    # use existing atomic saver
+    save_checkpoint(state, path, logger)
+
+
+def load_full_checkpoint(path, model, opt, proxy=None, proxy_opt=None, awp=None,
+                         scaler=None, scheduler=None, device='cpu'):
+    """
+    Load a checkpoint into model/optimizers. Returns (ckpt, start_epoch, resume_batch_idx).
+    Loads to CPU first for safety.
+    """
+    ckpt = safe_torch_load(path, map_location='cpu')
+    # load model (be permissive)
+    if 'model_state' in ckpt:
+        try:
+            model.load_state_dict(ckpt['model_state'])
+        except Exception as e:
+            # try strict=False if shapes differ slightly
+            try:
+                model.load_state_dict(ckpt['model_state'], strict=False)
+                print(f"Warning loading model_state with strict=False: {e}")
+            except Exception as e2:
+                print("Warning: failed to load model_state:", e2)
+
+    if 'opt_state' in ckpt:
+        try:
+            opt.load_state_dict(ckpt['opt_state'])
+        except Exception as e:
+            print("Warning: could not load optimizer state:", e)
+
+    # optional components
+    if proxy is not None and 'proxy_state' in ckpt and ckpt['proxy_state'] is not None:
+        try:
+            proxy.load_state_dict(ckpt['proxy_state'])
+        except Exception as e:
+            print("Warning: could not load proxy state:", e)
+    if proxy_opt is not None and 'proxy_opt_state' in ckpt and ckpt['proxy_opt_state'] is not None:
+        try:
+            proxy_opt.load_state_dict(ckpt['proxy_opt_state'])
+        except Exception as e:
+            print("Warning: could not load proxy optimizer state:", e)
+    if awp is not None and 'awp_state' in ckpt and ckpt['awp_state'] is not None and hasattr(awp, 'load_state_dict'):
+        try:
+            awp.load_state_dict(ckpt['awp_state'])
+        except Exception as e:
+            print("Warning: could not load awp state:", e)
+    if scaler is not None and 'scaler_state' in ckpt and ckpt['scaler_state'] is not None:
+        try:
+            scaler.load_state_dict(ckpt['scaler_state'])
+        except Exception as e:
+            print("Warning: could not load scaler state:", e)
+    if scheduler is not None and 'scheduler_state' in ckpt and ckpt['scheduler_state'] is not None:
+        try:
+            scheduler.load_state_dict(ckpt['scheduler_state'])
+        except Exception as e:
+            print("Warning: could not load scheduler state:", e)
+
+    # restore RNGs robustly
+    try:
+        if 'rng_numpy' in ckpt: np.random.set_state(ckpt['rng_numpy'])
+        if 'rng_python' in ckpt: pyrandom.setstate(ckpt['rng_python'])
+        if 'rng_torch' in ckpt:
+            rt = ckpt['rng_torch']
+            if isinstance(rt, torch.Tensor):
+                torch.set_rng_state(rt)
+            else:
+                # compatibility: attempt to convert to torch tensor
+                try:
+                    torch.set_rng_state(torch.tensor(rt, dtype=torch.uint8))
+                except Exception:
+                    pass
+        if torch.cuda.is_available() and 'rng_cuda_all' in ckpt:
+            cuda_states = []
+            for s in ckpt['rng_cuda_all']:
+                if isinstance(s, torch.Tensor):
+                    cuda_states.append(s)
+                else:
+                    cuda_states.append(torch.tensor(s, dtype=torch.uint8))
+            torch.cuda.set_rng_state_all(cuda_states)
+    except Exception as e:
+        print("Warning: restoring RNGs failed:", e)
+
+    start_epoch = int(ckpt.get('epoch', 0))
+    resume_batch_idx = int(ckpt.get('batch_idx', 0))
+    return ckpt, start_epoch, resume_batch_idx
 
 def normalize(X):
     # ensure X is on same device/dtype as mu/std
@@ -237,18 +368,26 @@ def main():
 
     logger.info(args)
     
+    # Prefer explicit resume path; otherwise try latest checkpoint (model_latest.pth)
     ckpt = None
+    resume_batch_idx = 0
+    start_epoch = 0
     if args.resume_from:
-        logger.info(f"Loading checkpoint for resume-from: {args.resume_from}")
-        ckpt = safe_torch_load(args.resume_from, map_location=device)
+        ckpt_path = args.resume_from
+        logger.info(f"Loading checkpoint for resume-from: {ckpt_path}")
+        ckpt, start_epoch, resume_batch_idx = load_full_checkpoint(ckpt_path, None, None) if False else (safe_torch_load(ckpt_path, map_location='cpu'), None, None)
+        # we'll actually load into model/opt after model is created (we keep ckpt for later)
+        ckpt = safe_torch_load(ckpt_path, map_location='cpu')
     else:
-        logger.info("No resume-from checkpoint provided; starting from scratch.")
-    
-    epoch_saved = ckpt.get('epoch') if ckpt is not None else None
-    logger.info(
-        f"Checkpoint epoch: {epoch_saved}; "
-        f"training will resume at {epoch_saved + 1 if epoch_saved is not None else 0}"
-)
+        latest_path = os.path.join(args.fname, 'model_latest.pth')
+        if os.path.exists(latest_path):
+            logger.info(f"Found latest checkpoint: {latest_path}, attempting to resume")
+            # We'll load properly below after models are created
+            ckpt = safe_torch_load(latest_path, map_location='cpu')
+            start_epoch = int(ckpt.get('epoch', 0))
+            resume_batch_idx = int(ckpt.get('batch_idx', 0))
+        else:
+            logger.info("No resume-from checkpoint provided and no model_latest.pth found; starting from scratch.")
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -310,23 +449,77 @@ def main():
     else:
         raise ValueError("Unknown model")
 
-    model = nn.DataParallel(model).to(device)
-    proxy = nn.DataParallel(proxy).to(device)
+    # If we found a checkpoint earlier (ckpt variable), load it robustly now
+    # prefer load_full_checkpoint helper to correctly set opt/proxy/awp/scaler state
+    if ckpt is not None:
+        try:
+            # Use our load function to restore states. We pass model/opt/proxy/proxy_opt/awp if available.
+            # awp_adversary may not be created yet; we'll restore awp state later when awp exists.
+            # Load to CPU-safe first, then move model to device
+            loaded = safe_torch_load(args.resume_from if args.resume_from else os.path.join(args.fname, 'model_latest.pth'), map_location='cpu')
+            # Load model weights
+            if 'model_state' in loaded:
+                try:
+                    model.load_state_dict(loaded['model_state'])
+                    logger.info("Loaded model weights from checkpoint.")
+                except Exception as e:
+                    try:
+                        model.load_state_dict(loaded['model_state'], strict=False)
+                        logger.warning(f"Loaded model weights with strict=False: {e}")
+                    except Exception as e2:
+                        logger.warning(f"Could not fully load model state from checkpoint: {e2}")
+            # Load optimizer
+            if 'opt_state' in loaded:
+                try:
+                    opt.load_state_dict(loaded['opt_state'])
+                    logger.info("Loaded optimizer state from checkpoint.")
+                except Exception as e:
+                    logger.warning(f"Could not fully load optimizer state from checkpoint: {e}")
+            # proxy and proxy_opt
+            if 'proxy_state' in loaded and loaded['proxy_state'] is not None:
+                try:
+                    proxy.load_state_dict(loaded['proxy_state'])
+                except Exception as e:
+                    logger.warning(f"Could not load proxy state: {e}")
+            if 'proxy_opt_state' in loaded and loaded['proxy_opt_state'] is not None:
+                try:
+                    proxy_opt.load_state_dict(loaded['proxy_opt_state'])
+                except Exception as e:
+                    logger.warning(f"Could not load proxy optimizer state: {e}")
+            # AWP state handled later after awp_adversary created
+            # restore RNGs (best-effort)
+            try:
+                if 'rng_numpy' in loaded: np.random.set_state(loaded['rng_numpy'])
+                if 'rng_python' in loaded: pyrandom.setstate(loaded['rng_python'])
+                if 'rng_torch' in loaded:
+                    rt = loaded['rng_torch']
+                    if isinstance(rt, torch.Tensor):
+                        torch.set_rng_state(rt)
+                    else:
+                        try:
+                            torch.set_rng_state(torch.tensor(rt, dtype=torch.uint8))
+                        except Exception:
+                            pass
+                if torch.cuda.is_available() and 'rng_cuda_all' in loaded:
+                    cuda_states = []
+                    for s in loaded['rng_cuda_all']:
+                        if isinstance(s, torch.Tensor):
+                            cuda_states.append(s)
+                        else:
+                            cuda_states.append(torch.tensor(s, dtype=torch.uint8))
+                    torch.cuda.set_rng_state_all(cuda_states)
+            except Exception:
+                logger.warning("Failed to restore RNG states from checkpoint.")
+            # set bookkeeping
+            best_test_robust_acc = loaded.get('best_test_robust_acc', best_test_robust_acc)
+            best_val_robust_acc = loaded.get('best_val_robust_acc', best_val_robust_acc)
+            # set start_epoch/resume_batch_idx if available
+            start_epoch = int(loaded.get('epoch', start_epoch))
+            resume_batch_idx = int(loaded.get('batch_idx', resume_batch_idx))
+            logger.info(f"Resuming training from epoch {start_epoch}, batch {resume_batch_idx}")
+        except Exception as e:
+            logger.warning(f"Loading checkpoint failed: {e}")
 
-    if args.l2:
-        decay, no_decay = [], []
-        for name,param in model.named_parameters():
-            if 'bn' not in name and 'bias' not in name:
-                decay.append(param)
-            else:
-                no_decay.append(param)
-        params = [{'params':decay, 'weight_decay':args.l2},
-                  {'params':no_decay, 'weight_decay': 0 }]
-    else:
-        params = model.parameters()
-
-    opt = torch.optim.SGD(params, lr=args.lr_max, momentum=0.9, weight_decay=5e-4)
-    proxy_opt = torch.optim.SGD(proxy.parameters(), lr=0.01)
     awp_adversary = AdvWeightPerturb(model=model, proxy=proxy, proxy_optim=proxy_opt, gamma=args.awp_gamma)
 
     criterion = nn.CrossEntropyLoss()
@@ -512,7 +705,24 @@ def main():
             train_robust_loss = 0
             train_robust_acc = 0
             train_n = 0
-            for i, batch in enumerate(train_batches):
+            # Build iterator and (if resuming) advance to saved batch index
+            train_iter = iter(train_batches)
+            # Only advance if we're resuming at this epoch
+            if start_epoch is not None and start_epoch == epoch and resume_batch_idx > 0:
+                logger.info(f"Advancing train iterator to batch {resume_batch_idx} for mid-epoch resume")
+                # advance the iterator resume_batch_idx times
+                for _skip in range(resume_batch_idx):
+                    try:
+                        next(train_iter)
+                    except StopIteration:
+                        break
+                # after advancing, set i to resume_batch_idx so logging matches
+                i_start = resume_batch_idx
+            else:
+                i_start = 0
+            
+            for i_offset, batch in enumerate(train_iter, start=i_start):
+                i = i_offset  # batch index relative to epoch
                 if args.eval:
                     break
                 X, y = batch['input'], batch['target']
@@ -561,23 +771,25 @@ def main():
                 robust_loss.backward()
                 opt.step()
                 if args.autosave_every > 0 and ((i + 1) % args.autosave_every == 0):
-                    state = {
-                        'epoch': epoch,
-                        'model_state': model.state_dict(),
-                        'opt_state': opt.state_dict(),
-                        'best_test_robust_acc': best_test_robust_acc,
-                        'best_val_robust_acc': best_val_robust_acc,
-                        'rng_numpy': np.random.get_state(),
-                        'rng_python': pyrandom.getstate(),
-                        'rng_torch': torch.get_rng_state(),
-                        'train_subset_indices': None if train_subset_indices is None else train_subset_indices.tolist(),
-                    }
-                    if torch.cuda.is_available():
-                        state['rng_cuda_all'] = torch.cuda.get_rng_state_all()
                     latest_path = os.path.join(args.fname, 'model_latest.pth')
-                    save_checkpoint(state, latest_path, logger)
-    
-    
+                    # save batch index as next batch to execute (i+1)
+                    save_full_checkpoint(
+                        latest_path,
+                        model=model,
+                        opt=opt,
+                        proxy=proxy,
+                        proxy_opt=proxy_opt,
+                        awp=awp_adversary if 'awp_adversary' in locals() else None,
+                        scaler=None,
+                        scheduler=None,
+                        epoch=epoch,
+                        batch_idx=(i + 1),
+                        best_test=best_test_robust_acc,
+                        best_val=best_val_robust_acc,
+                        train_subset_indices=train_subset_indices,
+                        logger=logger
+                    )
+
                 if epoch >= args.awp_warmup:
                     awp_adversary.restore(awp)
     
@@ -682,18 +894,44 @@ def main():
     
                 # save checkpoint
                 if (epoch+1) % args.chkpt_iters == 0 or epoch+1 == epochs:
+                    # save regular per-epoch files (for easy inspection)
                     torch.save(model.state_dict(), os.path.join(args.fname, f'model_{epoch}.pth'))
                     torch.save(opt.state_dict(), os.path.join(args.fname, f'opt_{epoch}.pth'))
+                    # save a full checkpoint including metadata (batch_idx=0 for next epoch)
+                    epoch_ckpt = os.path.join(args.fname, f'model_epoch_{epoch}.pth')
+                    save_full_checkpoint(
+                        epoch_ckpt, model, opt,
+                        proxy=proxy, proxy_opt=proxy_opt,
+                        awp=awp_adversary if 'awp_adversary' in locals() else None,
+                        scaler=None, scheduler=None,
+                        epoch=epoch + 1, batch_idx=0,
+                        best_test=best_test_robust_acc, best_val=best_val_robust_acc,
+                        train_subset_indices=train_subset_indices,
+                        logger=logger)
+                    # also update latest
+                    latest_path = os.path.join(args.fname, 'model_latest.pth')
+                    save_full_checkpoint(latest_path, model, opt,
+                                         proxy=proxy, proxy_opt=proxy_opt,
+                                         awp=awp_adversary if 'awp_adversary' in locals() else None,
+                                         scaler=None, scheduler=None,
+                                         epoch=epoch + 1, batch_idx=0,
+                                         best_test=best_test_robust_acc, best_val=best_val_robust_acc,
+                                         train_subset_indices=train_subset_indices,
+                                         logger=logger)
+
     
                 # save best
                 if test_robust_acc/test_n > best_test_robust_acc:
-                    torch.save({
-                            'state_dict':model.state_dict(),
-                            'test_robust_acc':test_robust_acc/test_n,
-                            'test_robust_loss':test_robust_loss/test_n,
-                            'test_loss':test_loss/test_n,
-                            'test_acc':test_acc/test_n,
-                        }, os.path.join(args.fname, f'model_best.pth'))
+                    best_path = os.path.join(args.fname, f'model_best.pth')
+                    save_full_checkpoint(
+                        best_path, model, opt,
+                        proxy=proxy, proxy_opt=proxy_opt,
+                        awp=awp_adversary if 'awp_adversary' in locals() else None,
+                        scaler=None, scheduler=None,
+                        epoch=epoch + 1, batch_idx=0,
+                        best_test=test_robust_acc/test_n, best_val=best_val_robust_acc,
+                        train_subset_indices=train_subset_indices,
+                        logger=logger)
                     best_test_robust_acc = test_robust_acc/test_n
             else:
                 logger.info('%d \t %.1f \t \t %.1f \t \t %.4f \t %.4f \t %.4f \t %.4f \t \t %.4f \t \t %.4f \t %.4f \t %.4f \t \t %.4f',
@@ -702,41 +940,35 @@ def main():
                     test_loss/test_n, test_acc/test_n, test_robust_loss/test_n, test_robust_acc/test_n)
                 return
     except KeyboardInterrupt:
-        logger.warning("KeyboardInterrupt caught — saving interrupt checkpoint...")
-        state = {
-            'epoch': epoch,
-            'model_state': model.state_dict(),
-            'opt_state': opt.state_dict(),
-            'best_test_robust_acc': best_test_robust_acc,
-            'best_val_robust_acc': best_val_robust_acc,
-            'rng_numpy': np.random.get_state(),
-            'rng_python': pyrandom.getstate(),
-            'rng_torch': torch.get_rng_state(),
-            'train_subset_indices': None if train_subset_indices is None else train_subset_indices.tolist(),
-        }
-        if torch.cuda.is_available():
-            state['rng_cuda_all'] = torch.cuda.get_rng_state_all()
-        save_checkpoint(state, os.path.join(args.fname, 'model_interrupt.pth'), logger)
-        raise
+    logger.warning("KeyboardInterrupt caught — saving interrupt checkpoint...")
+    state_path = os.path.join(args.fname, 'model_interrupt.pth')
+    save_full_checkpoint(
+        state_path, model, opt,
+        proxy=proxy, proxy_opt=proxy_opt,
+        awp=awp_adversary if 'awp_adversary' in locals() else None,
+        scaler=None, scheduler=None,
+        epoch=epoch, batch_idx=i,
+        best_test=best_test_robust_acc, best_val=best_val_robust_acc,
+        train_subset_indices=train_subset_indices,
+        logger=logger)
+    raise
+
     except Exception as e:
         logger.exception("Exception during training — saving crash checkpoint...")
-        state = {
-            'epoch': epoch,
-            'model_state': model.state_dict(),
-            'opt_state': opt.state_dict(),
-            'best_test_robust_acc': best_test_robust_acc,
-            'best_val_robust_acc': best_val_robust_acc,
-            'rng_numpy': np.random.get_state(),
-            'rng_python': pyrandom.getstate(),
-            'rng_torch': torch.get_rng_state(),
-            'exception': str(e),
-            'train_subset_indices': None if train_subset_indices is None else train_subset_indices.tolist(),
-        }
-        if torch.cuda.is_available():
-            state['rng_cuda_all'] = torch.cuda.get_rng_state_all()
-        save_checkpoint(state, os.path.join(args.fname, 'model_crash.pth'), logger)
+        state_path = os.path.join(args.fname, 'model_crash.pth')
+        # include exception string in extra
+        save_full_checkpoint(
+            state_path, model, opt,
+            proxy=proxy, proxy_opt=proxy_opt,
+            awp=awp_adversary if 'awp_adversary' in locals() else None,
+            scaler=None, scheduler=None,
+            epoch=epoch, batch_idx=i,
+            best_test=best_test_robust_acc, best_val=best_val_robust_acc,
+            train_subset_indices=train_subset_indices,
+            logger=logger,
+            extra={'exception': str(e)}
+        )
         raise
-
 
 if __name__ == "__main__":
     main()
