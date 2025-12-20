@@ -900,6 +900,7 @@ def main():
                         val_n += y.size(0)
     
             if not args.eval:
+                lr = opt.param_groups[0]['lr']
                 logger.info('%d \t %.1f \t \t %.1f \t \t %.4f \t %.4f \t %.4f \t %.4f \t \t %.4f \t \t %.4f \t %.4f \t %.4f \t \t %.4f',
                     epoch, train_time - start_time, test_time - train_time, lr,
                     train_loss/train_n, train_acc/train_n, train_robust_loss/train_n, train_robust_acc/train_n,
