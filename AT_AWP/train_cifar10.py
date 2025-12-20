@@ -367,6 +367,9 @@ def main():
         ])
 
     logger.info(args)
+    ckpt = None
+    resume_batch_idx = 0   # batch index within epoch to resume from (mid-epoch resume)
+    start_epoch = 0  
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
