@@ -430,7 +430,7 @@ def main():
     elif args.model == 'WideResNet':
         model = WideResNet(34, 10, widen_factor=args.width_factor, dropRate=0.0)
         proxy = WideResNet(34, 10, widen_factor=args.width_factor, dropRate=0.0)
-    elif args.model == 'ResNet18'
+    elif args.model == 'ResNet18':
         model = ResNet18()
         proxy = ResNet18()
     else:
