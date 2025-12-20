@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import os
+import csv
 import random as pyrandom
 import shutil
 from pathlib import Path
@@ -354,12 +355,32 @@ def save_checkpoint(state, fname, logger=None):
         logger.info(f"Saved checkpoint: {fname}")
 
 def main():
+    
     args = get_args()
     if args.awp_gamma <= 0.0:
         args.awp_warmup = np.infty
 
     if not os.path.exists(args.fname):
         os.makedirs(args.fname)
+    
+    import csv
+
+    metrics_path = os.path.join(args.fname, "metrics.csv")
+    
+    if not os.path.exists(metrics_path):
+        with open(metrics_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "epoch",
+                "train_clean_acc",
+                "train_robust_acc",
+                "test_clean_acc",
+                "test_robust_acc",
+                "train_loss",
+                "test_loss",
+                "lr"
+            ])
+
 
     logger = logging.getLogger(__name__)
     logging.basicConfig(
@@ -923,6 +944,48 @@ def main():
                                 'val_acc':val_acc/val_n,
                             }, os.path.join(args.fname, f'model_val.pth'))
                         best_val_robust_acc = val_robust_acc/val_n
+
+                # --- write metrics for this epoch (append) ---
+                # create header if first epoch / file missing
+                if not os.path.exists(metrics_path):
+                    with open(metrics_path, "w", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            "epoch",
+                            "wall_time_train",   # train_time - start_time
+                            "wall_time_epoch",   # test_time - train_time
+                            "lr",
+                            "train_loss",
+                            "train_acc",
+                            "train_robust_loss",
+                            "train_robust_acc",
+                            "test_loss",
+                            "test_acc",
+                            "test_robust_loss",
+                            "test_robust_acc",
+                            # optional extras:
+                            # "val_loss", "val_acc", "val_robust_loss", "val_robust_acc"
+                        ])
+                
+                # append row for this epoch
+                with open(metrics_path, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        epoch,
+                        train_time - start_time,
+                        test_time - train_time,
+                        lr,
+                        train_loss / train_n,
+                        train_acc / train_n,
+                        train_robust_loss / train_n,
+                        train_robust_acc / train_n,
+                        test_loss / test_n,
+                        test_acc / test_n,
+                        test_robust_loss / test_n,
+                        test_robust_acc / test_n,
+                    ])
+                # ------------------------------------------------
+
     
                 # save checkpoint
                 if (epoch+1) % args.chkpt_iters == 0 or epoch+1 == epochs:
