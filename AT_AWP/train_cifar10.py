@@ -16,6 +16,7 @@ from pathlib import Path
 
 from wideresnet import WideResNet
 from preactresnet import PreActResNet18
+from resnet import ResNet18
 from utils import *
 from utils_awp import AdvWeightPerturb
 
@@ -422,15 +423,6 @@ def main():
     epsilon = (args.epsilon / 255.)
     pgd_alpha = (args.pgd_alpha / 255.)
 
-    if args.model == 'PreActResNet18':
-        model = PreActResNet18()
-        proxy = PreActResNet18()
-    elif args.model == 'WideResNet':
-        model = WideResNet(34, 10, widen_factor=args.width_factor, dropRate=0.0)
-        proxy = WideResNet(34, 10, widen_factor=args.width_factor, dropRate=0.0)
-    else:
-        raise ValueError("Unknown model")
-
         # --- create model & optimizers first (so we can load into them) ---
         if args.model == 'PreActResNet18':
             model = PreActResNet18()
@@ -438,12 +430,21 @@ def main():
         elif args.model == 'WideResNet':
             model = WideResNet(34, 10, widen_factor=args.width_factor, dropRate=0.0)
             proxy = WideResNet(34, 10, widen_factor=args.width_factor, dropRate=0.0)
+        elif args.model == 'ResNet18'
+            model = ResNet18()
+            proxy = ResNet18()
         else:
             raise ValueError("Unknown model")
     
         # wrap and move to device
         model = nn.DataParallel(model).to(device)
         proxy = nn.DataParallel(proxy).to(device)
+        # after you construct proxy (if you construct it conditionally)
+        if proxy is not None:
+            # create an optimizer for the proxy parameters (choose sensible hyperparams)
+            proxy_opt = torch.optim.SGD(proxy.parameters(), lr=0.01)
+        else:
+            proxy_opt = None
     
         # set up optimizers (so checkpoint can restore them)
         if args.l2:
@@ -459,7 +460,6 @@ def main():
             params = model.parameters()
     
         opt = torch.optim.SGD(params, lr=args.lr_max, momentum=0.9, weight_decay=5e-4)
-        proxy_opt = torch.optim.SGD(proxy.parameters(), lr=0.01)
     
         # bookkeeping defaults
         start_epoch = 0
@@ -546,7 +546,9 @@ def main():
             logger.info("No checkpoint found; training from scratch.")
 
 
-    awp_adversary = AdvWeightPerturb(model=model, proxy=proxy, proxy_optim=proxy_opt, gamma=args.awp_gamma)
+    awp_adversary = None
+    if args.awp_gamma and args.awp_gamma > 0 and proxy is not None and proxy_opt is not None:
+        awp_adversary = AdvWeightPerturb(model=model, proxy=proxy, proxy_optim=proxy_opt, gamma=args.awp_gamma)
 
     criterion = nn.CrossEntropyLoss()
     
