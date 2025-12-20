@@ -237,7 +237,7 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 def attack_pgd(model, X, y, epsilon, alpha, attack_iters, restarts,
                norm, early_stop=False,
                mixup=False, y_a=None, y_b=None, lam=None):
-    max_loss = torch.zeros(y.shape[0], device=device, dtype=torch.float32)
+    max_loss = torch.zeros(y.shape[0], device=X.device, dtype=torch.float32)
     max_delta = torch.zeros_like(X, device=X.device)
     for _ in range(restarts):
         delta = torch.zeros_like(X, device=X.device)
@@ -251,21 +251,22 @@ def attack_pgd(model, X, y, epsilon, alpha, attack_iters, restarts,
             delta *= r/n*epsilon
         else:
             raise ValueError
-        delta = clamp(delta, lower_limit-X, upper_limit-X)
-        delta.requires_grad = True
+        delta = delta.detach()
+        delta.requires_grad_(True)
         for _ in range(attack_iters):
-            output = model(normalize(X + delta))
-            if early_stop:
-                index = torch.where(output.max(1)[1] == y)[0]
-            else:
-                index = slice(None,None,None)
-            if not isinstance(index, slice) and len(index) == 0:
-                break
-            if mixup:
-                criterion = nn.CrossEntropyLoss()
-                loss = mixup_criterion(criterion, model(normalize(X+delta)), y_a, y_b, lam)
-            else:
-                loss = F.cross_entropy(output, y)
+            with torch.enable_grad():
+                output = model(normalize(X + delta))
+                if early_stop:
+                    index = torch.where(output.max(1)[1] == y)[0]
+                else:
+                    index = slice(None,None,None)
+                if not isinstance(index, slice) and len(index) == 0:
+                    break
+                if mixup:
+                    criterion = nn.CrossEntropyLoss()
+                    loss = mixup_criterion(criterion, model(normalize(X+delta)), y_a, y_b, lam)
+                else:
+                    loss = F.cross_entropy(output, y)
             loss.backward()
             grad = delta.grad.detach()
             d = delta[index, :, :, :]
@@ -278,15 +279,18 @@ def attack_pgd(model, X, y, epsilon, alpha, attack_iters, restarts,
                 scaled_g = g/(g_norm + 1e-10)
                 d = (d + scaled_g*alpha).view(d.size(0),-1).renorm(p=2,dim=0,maxnorm=epsilon).view_as(d)
             d = clamp(d, lower_limit - x, upper_limit - x)
-            delta.data[index, :, :, :] = d
-            delta.grad.zero_()
-        if mixup:
-            criterion = nn.CrossEntropyLoss(reduction='none')
-            all_loss = mixup_criterion(criterion, model(normalize(X+delta)), y_a, y_b, lam)
-        else:
-            all_loss = F.cross_entropy(model(normalize(X+delta)), y, reduction='none')
-        max_delta[all_loss >= max_loss] = delta.detach()[all_loss >= max_loss]
-        max_loss = torch.max(max_loss, all_loss)
+            with torch.no_grad():
+                delta.data[index, :, :, :] = d
+            delta.grad = None
+        with torch.enable_grad():
+            if mixup:
+                criterion = nn.CrossEntropyLoss(reduction='none')
+                all_loss = mixup_criterion(criterion, model(normalize(X+delta)), y_a, y_b, lam)
+            else:
+                all_loss = F.cross_entropy(model(normalize(X+delta)), y, reduction='none')
+        better = all_loss >= max_loss
+        max_delta[better] = delta.detach()[better]
+        max_loss = torch.max(max_loss, all_loss.detach())
     return max_delta
 
 
