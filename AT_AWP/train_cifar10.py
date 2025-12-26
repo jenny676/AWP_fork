@@ -919,38 +919,78 @@ def main():
                         val_loss += loss.item() * y.size(0)
                         val_acc += (output.max(1)[1] == y).sum().item()
                         val_n += y.size(0)
-    
+            
+
+            def safe_avg(num, denom):
+                """Return float average or None if denom == 0 or denom is falsy."""
+                if not denom:
+                    return None
+                return float(num) / float(denom)
+            
+            def fmt(x):
+                """Format x for logger: 'N/A' when None."""
+                return f"{x:.4f}" if x is not None else "N/A"
+            
+            def cell(x):
+                """Format x for CSV cells: empty string when None."""
+                return "" if x is None else f"{x:.6f}"
+            
+            # === logging / metrics / checkpoint block ===
             if not args.eval:
                 lr = opt.param_groups[0]['lr']
-                logger.info('%d \t %.1f \t \t %.1f \t \t %.4f \t %.4f \t %.4f \t %.4f \t \t %.4f \t \t %.4f \t %.4f \t %.4f \t \t %.4f',
+            
+                # safe averages
+                train_loss_avg = safe_avg(train_loss, train_n)
+                train_acc_avg = safe_avg(train_acc, train_n)
+                train_robust_loss_avg = safe_avg(train_robust_loss, train_n)
+                train_robust_acc_avg = safe_avg(train_robust_acc, train_n)
+            
+                test_loss_avg = safe_avg(test_loss, test_n)
+                test_acc_avg = safe_avg(test_acc, test_n)
+                test_robust_loss_avg = safe_avg(test_robust_loss, test_n)
+                test_robust_acc_avg = safe_avg(test_robust_acc, test_n)
+            
+                # warn if any key denominator is zero
+                if train_n == 0 or test_n == 0:
+                    logger.warning(
+                        "Zero denominator detected when logging epoch metrics: train_n=%s, test_n=%s, epoch=%s, resumed_batch_idx=%s",
+                        train_n, test_n, epoch, (locals().get('batch_idx', 'N/A'))
+                    )
+            
+                logger.info('%d \t %.1f \t \t %.1f \t \t %.4f \t %s \t %s \t %s \t %s \t \t %s \t \t %s \t %s \t %s',
                     epoch, train_time - start_time, test_time - train_time, lr,
-                    train_loss/train_n, train_acc/train_n, train_robust_loss/train_n, train_robust_acc/train_n,
-                    test_loss/test_n, test_acc/test_n, test_robust_loss/test_n, test_robust_acc/test_n)
-    
+                    fmt(train_loss_avg), fmt(train_acc_avg), fmt(train_robust_loss_avg), fmt(train_robust_acc_avg),
+                    fmt(test_loss_avg), fmt(test_acc_avg), fmt(test_robust_loss_avg), fmt(test_robust_acc_avg))
+            
+                # validation logging & potential val-model save
                 if args.val:
-                    logger.info('validation %.4f \t %.4f \t %.4f \t %.4f',
-                        val_loss/val_n, val_acc/val_n, val_robust_loss/val_n, val_robust_acc/val_n)
-    
-                    if val_robust_acc/val_n > best_val_robust_acc:
+                    val_loss_avg = safe_avg(val_loss, val_n)
+                    val_acc_avg = safe_avg(val_acc, val_n)
+                    val_robust_loss_avg = safe_avg(val_robust_loss, val_n)
+                    val_robust_acc_avg = safe_avg(val_robust_acc, val_n)
+            
+                    logger.info('validation %s \t %s \t %s \t %s',
+                        fmt(val_loss_avg), fmt(val_acc_avg), fmt(val_robust_loss_avg), fmt(val_robust_acc_avg))
+            
+                    if val_robust_acc_avg is not None and val_robust_acc_avg > best_val_robust_acc:
                         torch.save({
-                                'state_dict':model.state_dict(),
-                                'test_robust_acc':test_robust_acc/test_n,
-                                'test_robust_loss':test_robust_loss/test_n,
-                                'test_loss':test_loss/test_n,
-                                'test_acc':test_acc/test_n,
-                                'val_robust_acc':val_robust_acc/val_n,
-                                'val_robust_loss':val_robust_loss/val_n,
-                                'val_loss':val_loss/val_n,
-                                'val_acc':val_acc/val_n,
+                                'state_dict': model.state_dict(),
+                                'test_robust_acc': test_robust_acc / test_n if test_n else None,
+                                'test_robust_loss': test_robust_loss / test_n if test_n else None,
+                                'test_loss': test_loss / test_n if test_n else None,
+                                'test_acc': test_acc / test_n if test_n else None,
+                                'val_robust_acc': val_robust_acc_avg,
+                                'val_robust_loss': val_robust_loss_avg,
+                                'val_loss': val_loss_avg,
+                                'val_acc': val_acc_avg,
                             }, os.path.join(args.fname, f'model_val.pth'))
-                        best_val_robust_acc = val_robust_acc/val_n
-
+                        best_val_robust_acc = val_robust_acc_avg
+            
                 # --- write metrics for this epoch (append) ---
-                # create header if first epoch / file missing
                 if not os.path.exists(metrics_path):
                     with open(metrics_path, "w", newline="") as f:
                         writer = csv.writer(f)
-                        writer.writerow([
+                        header = [
                             "epoch",
                             "wall_time_train",   # train_time - start_time
                             "wall_time_epoch",   # test_time - train_time
@@ -963,36 +1003,37 @@ def main():
                             "test_acc",
                             "test_robust_loss",
                             "test_robust_acc",
-                            # optional extras:
-                            # "val_loss", "val_acc", "val_robust_loss", "val_robust_acc"
-                        ])
-                
-                # append row for this epoch
+                        ]
+                        if args.val:
+                            header += ["val_loss", "val_acc", "val_robust_loss", "val_robust_acc"]
+                        writer.writerow(header)
+            
                 with open(metrics_path, "a", newline="") as f:
                     writer = csv.writer(f)
-                    writer.writerow([
+                    row = [
                         epoch,
                         train_time - start_time,
                         test_time - train_time,
                         lr,
-                        train_loss / train_n,
-                        train_acc / train_n,
-                        train_robust_loss / train_n,
-                        train_robust_acc / train_n,
-                        test_loss / test_n,
-                        test_acc / test_n,
-                        test_robust_loss / test_n,
-                        test_robust_acc / test_n,
-                    ])
+                        cell(train_loss_avg),
+                        cell(train_acc_avg),
+                        cell(train_robust_loss_avg),
+                        cell(train_robust_acc_avg),
+                        cell(test_loss_avg),
+                        cell(test_acc_avg),
+                        cell(test_robust_loss_avg),
+                        cell(test_robust_acc_avg),
+                    ]
+                    if args.val:
+                        row += [cell(val_loss_avg), cell(val_acc_avg), cell(val_robust_loss_avg), cell(val_robust_acc_avg)]
+                    writer.writerow(row)
+            
                 # ------------------------------------------------
-
-    
-                # save checkpoint
-                if (epoch+1) % args.chkpt_iters == 0 or epoch+1 == epochs:
-                    # save regular per-epoch files (for easy inspection)
+                # save checkpoint (per-epoch files & full metadata)
+                if (epoch + 1) % args.chkpt_iters == 0 or epoch + 1 == epochs:
                     torch.save(model.state_dict(), os.path.join(args.fname, f'model_{epoch}.pth'))
                     torch.save(opt.state_dict(), os.path.join(args.fname, f'opt_{epoch}.pth'))
-                    # save a full checkpoint including metadata (batch_idx=0 for next epoch)
+            
                     epoch_ckpt = os.path.join(args.fname, f'model_epoch_{epoch}.pth')
                     save_full_checkpoint(
                         epoch_ckpt, model, opt,
@@ -1003,7 +1044,7 @@ def main():
                         best_test=best_test_robust_acc, best_val=best_val_robust_acc,
                         train_subset_indices=train_subset_indices,
                         logger=logger)
-                    # also update latest
+            
                     latest_path = os.path.join(args.fname, 'model_latest.pth')
                     save_full_checkpoint(latest_path, model, opt,
                                          proxy=proxy, proxy_opt=proxy_opt,
@@ -1013,27 +1054,34 @@ def main():
                                          best_test=best_test_robust_acc, best_val=best_val_robust_acc,
                                          train_subset_indices=train_subset_indices,
                                          logger=logger)
-
-    
-                # save best
-                if test_robust_acc/test_n > best_test_robust_acc:
-                    best_path = os.path.join(args.fname, f'model_best.pth')
-                    save_full_checkpoint(
-                        best_path, model, opt,
-                        proxy=proxy, proxy_opt=proxy_opt,
-                        awp=awp_adversary if 'awp_adversary' in locals() else None,
-                        scaler=None, scheduler=None,
-                        epoch=epoch + 1, batch_idx=0,
-                        best_test=test_robust_acc/test_n, best_val=best_val_robust_acc,
-                        train_subset_indices=train_subset_indices,
-                        logger=logger)
-                    best_test_robust_acc = test_robust_acc/test_n
+            
+                # save best (only update if test_n valid)
+                if test_n:
+                    curr_test_robust = test_robust_acc / test_n
+                    if curr_test_robust > best_test_robust_acc:
+                        best_path = os.path.join(args.fname, f'model_best.pth')
+                        save_full_checkpoint(
+                            best_path, model, opt,
+                            proxy=proxy, proxy_opt=proxy_opt,
+                            awp=awp_adversary if 'awp_adversary' in locals() else None,
+                            scaler=None, scheduler=None,
+                            epoch=epoch + 1, batch_idx=0,
+                            best_test=curr_test_robust, best_val=best_val_robust_acc,
+                            train_subset_indices=train_subset_indices,
+                            logger=logger)
+                        best_test_robust_acc = curr_test_robust
             else:
+                # args.eval == True branch: mirror original behaviour but guard division
                 logger.info('%d \t %.1f \t \t %.1f \t \t %.4f \t %.4f \t %.4f \t %.4f \t \t %.4f \t \t %.4f \t %.4f \t %.4f \t \t %.4f',
                     epoch, train_time - start_time, test_time - train_time, -1,
                     -1, -1, -1, -1,
-                    test_loss/test_n, test_acc/test_n, test_robust_loss/test_n, test_robust_acc/test_n)
+                    test_loss/test_n if test_n else float('nan'),
+                    test_acc/test_n if test_n else float('nan'),
+                    test_robust_loss/test_n if test_n else float('nan'),
+                    test_robust_acc/test_n if test_n else float('nan'))
                 return
+            # === end replacement block ===
+                
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt caught — saving interrupt checkpoint...")
         state_path = os.path.join(args.fname, 'model_interrupt.pth')
