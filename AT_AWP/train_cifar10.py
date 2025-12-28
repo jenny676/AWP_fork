@@ -500,75 +500,6 @@ def main():
         candidate = os.path.join(args.fname, 'model_latest.pth')
         if os.path.exists(candidate):
             ckpt_path = candidate
-    
-    if ckpt_path is not None:
-        logger.info(f"Attempting to load checkpoint: {ckpt_path}")
-        try:
-            # load to CPU first (safe) and then restore into model/optimizers
-            loaded = safe_torch_load(ckpt_path, map_location='cpu')
-            # load model (permissive)
-            if 'model_state' in loaded:
-                try:
-                    model.load_state_dict(loaded['model_state'])
-                    logger.info("Model weights loaded from checkpoint.")
-                except Exception as e:
-                    try:
-                        model.load_state_dict(loaded['model_state'], strict=False)
-                        logger.warning(f"Model loaded with strict=False: {e}")
-                    except Exception as e2:
-                        logger.warning(f"Model load failed: {e2}")
-    
-            # load optimizer states if present
-            if 'opt_state' in loaded:
-                try:
-                    opt.load_state_dict(loaded['opt_state'])
-                    logger.info("Optimizer state restored.")
-                except Exception as e:
-                    logger.warning(f"Could not restore optimizer state: {e}")
-    
-            if 'proxy_state' in loaded and loaded['proxy_state'] is not None:
-                try:
-                    proxy.load_state_dict(loaded['proxy_state'])
-                except Exception as e:
-                    logger.warning(f"Could not restore proxy state: {e}")
-            if 'proxy_opt_state' in loaded and loaded['proxy_opt_state'] is not None:
-                try:
-                    proxy_opt.load_state_dict(loaded['proxy_opt_state'])
-                except Exception as e:
-                    logger.warning(f"Could not restore proxy optimizer state: {e}")
-    
-            # restore RNGs (best-effort)
-            try:
-                if 'rng_numpy' in loaded: np.random.set_state(loaded['rng_numpy'])
-                if 'rng_python' in loaded: pyrandom.setstate(loaded['rng_python'])
-                if 'rng_torch' in loaded:
-                    rt = loaded['rng_torch']
-                    if isinstance(rt, torch.Tensor):
-                        torch.set_rng_state(rt)
-                    else:
-                        # attempt conversion for older pickles
-                        torch.set_rng_state(torch.tensor(rt, dtype=torch.uint8))
-                if torch.cuda.is_available() and 'rng_cuda_all' in loaded:
-                    cuda_states = []
-                    for s in loaded['rng_cuda_all']:
-                        cuda_states.append(torch.tensor(s, dtype=torch.uint8) if not isinstance(s, torch.Tensor) else s)
-                    torch.cuda.set_rng_state_all(cuda_states)
-            except Exception as e:
-                logger.warning(f"RNG restore failed: {e}")
-    
-            # bookkeeping
-            start_epoch = int(loaded.get('epoch', 0))
-            resume_batch_idx = int(loaded.get('batch_idx', 0))
-            best_test_robust_acc = loaded.get('best_test_robust_acc', best_test_robust_acc)
-            best_val_robust_acc = loaded.get('best_val_robust_acc', best_val_robust_acc)
-            # train_subset_indices if present
-            if 'train_subset_indices' in loaded:
-                train_subset_indices = loaded.get('train_subset_indices', train_subset_indices)
-            logger.info(f"Resuming from epoch={start_epoch}, batch_idx={resume_batch_idx}")
-        except Exception as e:
-            logger.warning(f"Failed to load checkpoint {ckpt_path}: {e}")
-    else:
-        logger.info("No checkpoint found; training from scratch.")
 
     awp_adversary = None
     if args.awp_gamma and args.awp_gamma > 0 and proxy is not None and proxy_opt is not None:
@@ -712,35 +643,48 @@ def main():
     elif args.lr_schedule == 'cyclic':
         lr_schedule = lambda t: np.interp([t], [0, 0.4 * args.epochs, args.epochs], [0, args.lr_max, 0])[0]
 
-    best_test_robust_acc = 0
-    best_val_robust_acc = 0
+    # --- unified checkpoint loading (single, robust load) ---
+    ckpt = None
+    resume_batch_idx = 0
     start_epoch = 0
-# prefer explicit resume-from path if provided
-    if args.resume_from:
-        ckpt_path = args.resume_from
-        logger.info(f"Resuming from checkpoint: {ckpt_path}")
-        ckpt = safe_torch_load(ckpt_path, map_location=device)
-        model.load_state_dict(ckpt['model_state'])
-        if 'opt_state' in ckpt:
-            try:
-                opt.load_state_dict(ckpt['opt_state'])
-            except Exception as e:
-                logger.warning(f"Could not load optimizer state cleanly: {e}")
-        start_epoch = ckpt.get('epoch', 0) + 1
-        best_test_robust_acc = ckpt.get('best_test_robust_acc', best_test_robust_acc)
-        best_val_robust_acc = ckpt.get('best_val_robust_acc', best_val_robust_acc)
-    elif args.resume:
-        start_epoch = args.resume
-        model.load_state_dict(safe_torch_load(os.path.join(args.fname, f'model_{start_epoch-1}.pth'), map_location=device))
-        opt.load_state_dict(safe_torch_load(os.path.join(args.fname, f'opt_{start_epoch-1}.pth'), map_location=device))
-        logger.info(f'Resuming at epoch {start_epoch}')
-        if os.path.exists(os.path.join(args.fname, f'model_best.pth')):
-            best_test_robust_acc = safe_torch_load(os.path.join(args.fname, f'model_best.pth'))['test_robust_acc']
-        if args.val and os.path.exists(os.path.join(args.fname, f'model_val.pth')):
-            best_val_robust_acc = safe_torch_load(os.path.join(args.fname, f'model_val.pth'))['val_robust_acc']
+    
+    if ckpt_path is not None:
+        logger.info(f"Attempting to load checkpoint: {ckpt_path}")
+        try:
+            # Use helper to load and get epoch/batch info robustly
+            loaded_ckpt, loaded_epoch, loaded_batch_idx = load_full_checkpoint(
+                ckpt_path,
+                model=model, opt=opt, proxy=proxy, proxy_opt=proxy_opt,
+                awp=None, scaler=None, scheduler=None, device='cpu'
+            )
+            # keep full ckpt dict accessible
+            ckpt = loaded_ckpt
+            logger.debug("Checkpoint contains keys: %s", list(ckpt.keys()))
+    
+            # saved_epoch/batch semantics: if batch_idx > 0 -> mid-epoch resume
+            saved_epoch = int(ckpt.get('epoch', 0))
+            saved_batch = int(ckpt.get('batch_idx', 0))
+            if saved_batch > 0:
+                start_epoch = saved_epoch
+                resume_batch_idx = saved_batch
+            else:
+                # start_epoch uses saved_epoch directly (works whether saved_epoch is "next epoch" or last completed)
+                start_epoch = saved_epoch
+                resume_batch_idx = 0
+    
+            # restore optional bookkeeping already handled in load_full_checkpoint,
+            # but keep local copies for later usage
+            best_test_robust_acc = ckpt.get('best_test_robust_acc', best_test_robust_acc)
+            best_val_robust_acc = ckpt.get('best_val_robust_acc', best_val_robust_acc)
+            if 'train_subset_indices' in ckpt:
+                train_subset_indices = ckpt.get('train_subset_indices', train_subset_indices)
+    
+            logger.info(f"Resuming from epoch={start_epoch}, batch_idx={resume_batch_idx}")
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint {ckpt_path}: {e}")
     else:
-        start_epoch = 0
-
+        logger.info("No checkpoint found; training from scratch.")
+    # --- end unified checkpoint loading ---
 
     if args.eval:
         if not args.resume:
