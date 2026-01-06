@@ -55,31 +55,95 @@ if ModelClass is None:
     raise ImportError("Could not find ResNet class in your repo. Ensure resnet.py exists and defines ResNet18 or ResNet.")
 
 # ---------------- Build model and load checkpoint ----------------
+# (ensure CHECKPOINT_PATH and DEVICE are set above)
 model = ModelClass(num_classes=10).to(DEVICE)  # change num_classes if needed
-ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
 
-# Common checkpoint shapes
-if isinstance(ckpt, dict) and ("state_dict" in ckpt or "model_state_dict" in ckpt):
-    state = ckpt.get("state_dict", ckpt.get("model_state_dict"))
-else:
-    state = ckpt
+# Robust checkpoint loading block
+import torch
+from pprint import pprint
 
+def extract_state_dict(ckpt):
+    candidates = [
+        "state_dict",
+        "model_state",
+        "model_state_dict",
+        "model",
+        "model_state_dict_ema",
+        "network",
+    ]
+    for c in candidates:
+        if isinstance(ckpt, dict) and c in ckpt:
+            candidate = ckpt[c]
+            if isinstance(candidate, dict) and "state_dict" in candidate:
+                return candidate["state_dict"]
+            return candidate
+    if isinstance(ckpt, dict):
+        for k, v in ckpt.items():
+            if isinstance(v, dict):
+                sample_vals = list(v.values())[:4]
+                if sample_vals and all(hasattr(x, "ndim") or isinstance(x, torch.Tensor) for x in sample_vals):
+                    return v
+    return None
+
+# load checkpoint allowing non-weights (trusted local file)
+try:
+    ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
+except TypeError:
+    ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+
+print("Top-level checkpoint type:", type(ckpt))
+if isinstance(ckpt, dict):
+    print("Top-level keys:")
+    pprint(list(ckpt.keys())[:50])
+
+state = extract_state_dict(ckpt)
+if state is None:
+    raise RuntimeError("Could not find a state_dict-like object in the checkpoint. Inspect printed keys above.")
+
+if isinstance(state, dict):
+    print("Found candidate state-dict with keys (sample):", list(state.keys())[:10])
+
+def strip_module_prefix(state_dict):
+    new_sd = {}
+    for k, v in state_dict.items():
+        new_key = k.replace("module.", "") if k.startswith("module.") else k
+        if new_key.startswith("model_state."):
+            new_key = new_key[len("model_state."):]
+        new_sd[new_key] = v
+    return new_sd
+
+if not isinstance(state, dict) or not all(isinstance(k, str) for k in state.keys()):
+    raise RuntimeError("Extracted state is not a dict of parameter tensors. Inspect checkpoint structure manually.")
+
+# Try to load
+loaded = False
 try:
     model.load_state_dict(state)
-    print("Loaded state_dict into model.")
-except RuntimeError as e:
-    # try stripping module. prefix
-    new_state = {}
+    print("Loaded state_dict with strict=True (direct).")
+    loaded = True
+except Exception as e_strict:
+    print("Strict load failed, attempting to strip prefixes and retry. Error:")
+    print(e_strict)
+    stripped = strip_module_prefix(state)
     try:
-        for k, v in state.items():
-            new_state[k.replace("module.", "")] = v
-        model.load_state_dict(new_state)
-        print("Loaded checkpoint after stripping 'module.' prefixes.")
+        model.load_state_dict(stripped)
+        print("Loaded state_dict after stripping prefixes (strict=True).")
+        loaded = True
     except Exception as e2:
-        print("Failed to load state_dict into model. Exception:", e2)
-        raise
+        print("Still failed to load with strict=True after stripping prefixes. Error:")
+        print(e2)
+        load_res = model.load_state_dict(stripped, strict=False)
+        print("Loaded with strict=False. Missing keys (will be randomly initialized):")
+        pprint(load_res.missing_keys)
+        print("Unexpected keys in checkpoint (ignored):")
+        pprint(load_res.unexpected_keys)
+        if len(load_res.missing_keys) > 0:
+            print("\nWARNING: many missing keys — check that the ResNet variant and num_classes match training.")
+        loaded = True  # we still set True because strict=False did load params that exist
 
-model.eval()
+if loaded:
+    model.eval()
+    print("Model ready. Moving on to landscape computation.")
 
 # ---------------- Fixed minibatch (create if missing) ----------------
 if not os.path.exists(FIXED_BATCH_PATH):
