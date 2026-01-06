@@ -56,7 +56,7 @@ if ModelClass is None:
 
 # ---------------- Build model and load checkpoint ----------------
 model = ModelClass(num_classes=10).to(DEVICE)  # change num_classes if needed
-ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
 
 # Common checkpoint shapes
 if isinstance(ckpt, dict) and ("state_dict" in ckpt or "model_state_dict" in ckpt):
@@ -99,7 +99,7 @@ if not os.path.exists(FIXED_BATCH_PATH):
         print("Failed to create fixed batch automatically. Exception:", e)
         raise RuntimeError("Create a fixed_batch.pt at FIXED_BATCH_PATH manually and rerun.")
 
-fb = torch.load(FIXED_BATCH_PATH, map_location=DEVICE)
+fb = torch.load(FIXED_BATCH_PATH, map_location=DEVICE, weights_only=False)
 inputs = fb["inputs"].to(DEVICE)
 targets = fb["targets"].to(DEVICE)
 print("Using fixed batch:", inputs.shape)
