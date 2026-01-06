@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader, Subset
 import matplotlib.pyplot as plt
 
 # ---------------- USER CONFIG ----------------
-CHECKPOINT_PATH = "/content/drive/MyDrive/TDL/AWP/AWP_10%"   # change if your checkpoint is elsewhere
+CHECKPOINT_PATH = "/content/drive/MyDrive/TDL/AWP/AWP_10%/model_best.pth"   # change if your checkpoint is elsewhere
 SAVE_PATH = "/content/drive/MyDrive/TDL/AWP/loss_landscape_resnet18.png"
 
 NUM_POINTS = 21         # grid resolution per axis (reduce to 11 for speed)
